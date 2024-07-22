@@ -169,6 +169,7 @@ snowflake = ["snowflake-connector-python", "pyarrow", "pyarrow-hotfix"]
 sqlite = ["regex", "pyarrow", "pyarrow-hotfix"]
 risingwave = ["psycopg2", "pyarrow", "pyarrow-hotfix"]
 trino = ["trino", "pyarrow", "pyarrow-hotfix"]
+sqlflite = ["adbc-driver-flightsql", "adbc-driver-manager", "pyarrow", "pyarrow-hotfix"]
 # non-backend extras
 visualization = ["graphviz"]
 decompiler = ["black"]
@@ -196,6 +197,7 @@ risingwave = "ibis.backends.risingwave"
 pyspark = "ibis.backends.pyspark"
 snowflake = "ibis.backends.snowflake"
 sqlite = "ibis.backends.sqlite"
+sqlflite = "ibis.backends.sqlflite"
 trino = "ibis.backends.trino"
 
 [tool.pytest.ini_options]
@@ -339,6 +341,7 @@ markers = [
   "pyspark: PySpark tests",
   "snowflake: Snowflake tests",
   "sqlite: SQLite tests",
+  "sqlflite: SQLFlite tests",
   "trino: Trino tests",
   "tpch: TPC-H tests",
   "tpcds: TPC-DS tests",
