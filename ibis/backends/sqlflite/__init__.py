@@ -10,6 +10,8 @@ import warnings
 from operator import itemgetter
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import unquote_plus
+import re
 
 import duckdb
 from adbc_driver_flightsql import dbapi as sqlflite, DatabaseOptions
@@ -35,6 +37,7 @@ from ibis.util import deprecated
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, MutableMapping, Sequence
+    from urllib.parse import ParseResult
 
     import pandas as pd
     import polars as pl
@@ -54,28 +57,82 @@ class _Settings:
 
     def __getitem__(self, key: str) -> Any:
         with self.con.cursor() as cur:
-            maybe_value = cur.execute(
-                "select value from duckdb_settings() where name = $1", [key]
-            ).fetchone()
+            cur.execute(f"SELECT value FROM duckdb_settings() WHERE name = {key!r}")
+            maybe_value = cur.fetchone()
         if maybe_value is not None:
             return maybe_value[0]
-        raise KeyError(key)
+        else:
+            raise KeyError(key)
 
     def __setitem__(self, key, value):
         with self.con.cursor() as cur:
             cur.execute(f"SET {key} = {str(value)!r}")
 
     def __repr__(self):
-
-        return repr(self.con.sql("from duckdb_settings()"))
+        with self.con.cursor() as cur:
+            return repr(cur.execute("SELECT * FROM duckdb_settings()").fetchall())
 
 
 class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
     name = "sqlflite"
     compiler = DuckDBCompiler()
+    dialect = "duckdb"
 
-    def _define_udf_translation_rules(self, expr):
-        """No-op: UDF translation rules are defined in the compiler."""
+    def _from_url(self, url: ParseResult, **kwargs):
+        """Connect to a backend using a URL `url`.
+
+        Parameters
+        ----------
+        url
+            URL with which to connect to a backend.
+        kwargs
+            Additional keyword arguments
+
+        Returns
+        -------
+        BaseBackend
+            A backend instance
+
+        """
+        database, *schema = url.path[1:].split("/", 1)
+        connect_args = {
+            "user": url.username,
+            "password": unquote_plus(url.password or ""),
+            "host": url.hostname,
+            "database": database or "",
+            "schema": schema[0] if schema else "",
+            "port": url.port,
+        }
+
+        kwargs.update(connect_args)
+        self._convert_kwargs(kwargs)
+
+        if "user" in kwargs and not kwargs["user"]:
+            del kwargs["user"]
+
+        if "host" in kwargs and not kwargs["host"]:
+            del kwargs["host"]
+
+        if "database" in kwargs and not kwargs["database"]:
+            del kwargs["database"]
+
+        if "schema" in kwargs and not kwargs["schema"]:
+            del kwargs["schema"]
+
+        if "password" in kwargs and kwargs["password"] is None:
+            del kwargs["password"]
+
+        if "port" in kwargs and kwargs["port"] is None:
+            del kwargs["port"]
+
+        if "useEncryption" in kwargs:
+            kwargs["use_encryption"] = kwargs.pop("useEncryption", "false").lower() == "true"
+
+        if "disableCertificateVerification" in kwargs:
+            kwargs["disable_certificate_verification"] = kwargs.pop("disableCertificateVerification", "false").lower() == "true"
+
+        return self.connect(**kwargs)
+
 
     @property
     def settings(self) -> _Settings:
@@ -93,10 +150,9 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
             [(db,)] = cur.fetchall()
         return db
 
-    # TODO(kszucs): should be moved to the base SQLGLot backend
     def raw_sql(self, query: str | sg.Expression, **kwargs: Any) -> Any:
         with contextlib.suppress(AttributeError):
-            query = query.sql(dialect="duckdb")
+            query = query.sql(dialect=self.dialect)
 
         cur = self.con.cursor()
         cur.execute(query, **kwargs)
@@ -107,11 +163,6 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         self, expr: ir.Expr, limit: str | None = None, params=None, **_: Any
     ):
         sql = super()._to_sqlglot(expr, limit=limit, params=params)
-
-        table_expr = expr.as_table()
-        geocols = frozenset(
-            name for name, typ in table_expr.schema().items() if typ.is_geospatial()
-        )
 
         return sql
 
@@ -130,7 +181,7 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         temp: bool = False,
         overwrite: bool = False,
     ):
-        """Create a table in DuckDB.
+        """Create a table in SQLFlite.
 
         Parameters
         ----------
@@ -214,8 +265,8 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
 
         initial_table = sge.Table(
             this=sg.to_identifier(temp_name, quoted=self.compiler.quoted),
-            catalog=catalog,
-            db=database,
+            catalog=sg.to_identifier(catalog, quoted=self.compiler.quoted),
+            db=sg.to_identifier(database, quoted=self.compiler.quoted),
         )
         target = sge.Schema(this=initial_table, expressions=column_defs)
 
@@ -228,44 +279,45 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         # This is the same table as initial_table unless overwrite == True
         final_table = sge.Table(
             this=sg.to_identifier(name, quoted=self.compiler.quoted),
-            catalog=catalog,
-            db=database,
+            catalog=sg.to_identifier(catalog, quoted=self.compiler.quoted),
+            db=sg.to_identifier(database, quoted=self.compiler.quoted),
         )
-        with self._safe_raw_sql(create_stmt) as cur:
-            if query is not None:
-                insert_stmt = sge.insert(query, into=initial_table).sql(self.name)
-                cur.execute(insert_stmt).fetchall()
+        with self._safe_raw_sql(create_stmt) as create_table_cur:
+            with self.con.cursor() as cur:
+                if query is not None:
+                    insert_stmt = sge.insert(query, into=initial_table).sql(dialect=self.dialect)
+                    cur.execute(insert_stmt)
 
-            if overwrite:
-                cur.execute(
-                    sge.Drop(kind="TABLE", this=final_table, exists=True).sql(self.name)
-                )
-                # TODO: This branching should be removed once DuckDB >=0.9.3 is
-                # our lower bound (there's an upstream bug in 0.9.2 that
-                # disallows renaming temp tables)
-                # We should (pending that release) be able to remove the if temp
-                # branch entirely.
-                if temp:
+                if overwrite:
                     cur.execute(
-                        sge.Create(
-                            kind="TABLE",
-                            this=final_table,
-                            expression=sg.select(STAR).from_(initial_table),
-                            properties=sge.Properties(expressions=properties),
-                        ).sql(self.name)
+                        sge.Drop(kind="TABLE", this=final_table, exists=True).sql(dialect=self.dialect)
                     )
-                    cur.execute(
-                        sge.Drop(kind="TABLE", this=initial_table, exists=True).sql(
-                            self.name
+                    # TODO: This branching should be removed once DuckDB >=0.9.3 is
+                    # our lower bound (there's an upstream bug in 0.9.2 that
+                    # disallows renaming temp tables)
+                    # We should (pending that release) be able to remove the if temp
+                    # branch entirely.
+                    if temp:
+                        cur.execute(
+                            sge.Create(
+                                kind="TABLE",
+                                this=final_table,
+                                expression=sg.select(STAR).from_(initial_table),
+                                properties=sge.Properties(expressions=properties),
+                            ).sql(dialect=self.dialect)
                         )
-                    )
-                else:
-                    cur.execute(
-                        sge.AlterTable(
-                            this=initial_table,
-                            actions=[sge.RenameTable(this=final_table)],
-                        ).sql(self.name)
-                    )
+                        cur.execute(
+                            sge.Drop(kind="TABLE", this=initial_table, exists=True).sql(
+                                self.name
+                            )
+                        )
+                    else:
+                        cur.execute(
+                            sge.AlterTable(
+                                this=initial_table,
+                                actions=[sge.RenameTable(this=final_table)],
+                            ).sql(dialect=self.dialect)
+                        )
 
         if temp_memtable_view is not None:
             self.con.unregister(temp_memtable_view)
@@ -402,29 +454,19 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
             out = cur.fetch_arrow_table()
         return self._filter_with_like(out[col].to_pylist(), like=like)
 
-    @staticmethod
-    def _convert_kwargs(kwargs: MutableMapping) -> None:
-        read_only = str(kwargs.pop("read_only", "False")).capitalize()
-        try:
-            kwargs["read_only"] = ast.literal_eval(read_only)
-        except ValueError as e:
-            raise ValueError(
-                f"invalid value passed to ast.literal_eval: {read_only!r}"
-            ) from e
-
     @property
     def version(self) -> str:
-        # TODO: there is a `PRAGMA version` we could use instead
-        import importlib.metadata
+        with self._safe_raw_sql("SELECT version()") as cur:
+            [(version,)] = cur.fetchall()
 
-        return importlib.metadata.version("duckdb")
+        return version
 
     def do_connect(
         self,
         host: str | None = None,
         user: str | None = None,
         password: str | None = None,
-        port: int = 5432,
+        port: int = 31337,
         database: str | None = None,
         schema: str | None = None,
         use_encryption: bool | None = None,
@@ -446,7 +488,7 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         database
             Database to connect to
         schema
-            PostgreSQL schema to use. If `None`, use the default `search_path`.
+            SQLFlite schema to use. If `None`, use the default `search_path`.
         use_encryption
             Use encryption via TLS
         disable_certificate_verification
@@ -459,10 +501,10 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         >>> import os
         >>> import getpass
         >>> import ibis
-        >>> host = os.environ.get("IBIS_TEST_POSTGRES_HOST", "localhost")
-        >>> user = os.environ.get("IBIS_TEST_POSTGRES_USER", getpass.getuser())
-        >>> password = os.environ.get("IBIS_TEST_POSTGRES_PASSWORD")
-        >>> database = os.environ.get("IBIS_TEST_POSTGRES_DATABASE", "ibis_testing")
+        >>> host = os.environ.get("IBIS_TEST_SQLFLITE_HOST", "localhost")
+        >>> user = os.environ.get("IBIS_TEST_SQLFLITE_USER", getpass.getuser())
+        >>> password = os.environ.get("IBIS_TEST_SQLFLITE_PASSWORD")
+        >>> database = os.environ.get("IBIS_TEST_SQLFLITE_DATABASE", "ibis_testing")
         >>> con = connect(database=database, host=host, user=user, password=password)
         >>> con.list_tables()  # doctest: +ELLIPSIS
         [...]
@@ -490,12 +532,20 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         if use_encryption:
             connection_scheme += "+tls"
 
+        db_kwargs = dict(username=user, password=password)
+        if use_encryption and disable_certificate_verification is not None:
+            db_kwargs[DatabaseOptions.TLS_SKIP_VERIFY.value] = str(
+                disable_certificate_verification
+            ).lower()
+
         self.con = sqlflite.connect(uri=f"{connection_scheme}://{host}:{port}",
-                                    db_kwargs={"username": user,
-                                               "password": password,
-                                               DatabaseOptions.TLS_SKIP_VERIFY.value: str(disable_certificate_verification).lower()
-                                               }
+                                    db_kwargs=db_kwargs
                                     )
+
+        vendor_version = self.con.adbc_get_info().get("vendor_version")
+
+        if not re.search(pattern="^duckdb ", string=vendor_version):
+            raise exc.UnsupportedBackendType(f"Unsupported SQFLite server backend: '{vendor_version}'")
 
         # Default timezone, can't be set with `config`
         self.settings["timezone"] = "UTC"
@@ -507,7 +557,7 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
     ) -> None:
         if catalog is not None:
             raise exc.UnsupportedOperationError(
-                "DuckDB cannot create a database in another catalog."
+                "SQLFlite cannot create a database in another catalog."
             )
 
         name = sg.table(name, catalog=catalog, quoted=self.compiler.quoted)
@@ -519,7 +569,7 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
     ) -> None:
         if catalog is not None:
             raise exc.UnsupportedOperationError(
-                "DuckDB cannot drop a database in another catalog."
+                "SQLFlite cannot drop a database in another catalog."
             )
 
         name = sg.table(name, catalog=catalog, quoted=self.compiler.quoted)
@@ -730,8 +780,6 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
             The just-registered table
 
         """
-        source_list = util.normalize_filenames(source_list)
-
         table_name = table_name or util.gen_name("read_parquet")
 
         # Default to using the native duckdb parquet reader
@@ -918,8 +966,8 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
             )
             .sql(self.dialect)
         )
-        with self.con.cursor() as cur:
-            out = cur.execute(sql).fetch_arrow_table()
+        with self._safe_raw_sql(sql) as cur:
+            out = cur.fetch_arrow_table()
 
         return self._filter_with_like(out[col].to_pylist(), like)
 
@@ -1001,68 +1049,10 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
 
         query_con = f"""ATTACH 'host={parsed.hostname} user={parsed.username} password={parsed.password} port={parsed.port} database={database}' AS {catalog} (TYPE mysql)"""
 
-        with self._safe_raw_sql(query_con):
-            pass
+        with self._safe_raw_sql(query_con) as cur:
+            cur.fetchall()
 
         return self.table(table_name, database=(catalog, database))
-
-    def read_sqlite(
-        self, path: str | Path, *, table_name: str | None = None
-    ) -> ir.Table:
-        """Register a table from a SQLite database into a DuckDB table.
-
-        Parameters
-        ----------
-        path
-            The path to the SQLite database
-        table_name
-            The table to read
-
-        Returns
-        -------
-        ir.Table
-            The just-registered table.
-
-        Examples
-        --------
-        >>> import ibis
-        >>> import sqlite3
-        >>> ibis.options.interactive = True
-        >>> with sqlite3.connect("/tmp/sqlite.db") as con:
-        ...     con.execute("DROP TABLE IF EXISTS t")  # doctest: +ELLIPSIS
-        ...     con.execute("CREATE TABLE t (a INT, b TEXT)")  # doctest: +ELLIPSIS
-        ...     con.execute(
-        ...         "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')"
-        ...     )  # doctest: +ELLIPSIS
-        <...>
-        >>> con = ibis.connect("duckdb://")
-        >>> t = con.read_sqlite(path="/tmp/sqlite.db", table_name="t")
-        >>> t
-        ┏━━━━━━━┳━━━━━━━━┓
-        ┃ a     ┃ b      ┃
-        ┡━━━━━━━╇━━━━━━━━┩
-        │ int64 │ string │
-        ├───────┼────────┤
-        │     1 │ a      │
-        │     2 │ b      │
-        │     3 │ c      │
-        └───────┴────────┘
-
-        """
-
-        if table_name is None:
-            raise ValueError("`table_name` is required when registering a sqlite table")
-
-        self._create_temp_view(
-            table_name,
-            sg.select(STAR).from_(
-                self.compiler.f.sqlite_scan(
-                    sg.to_identifier(str(path), quoted=True), table_name
-                )
-            ),
-        )
-
-        return self.table(table_name)
 
     def attach(
         self, path: str | Path, name: str | None = None, read_only: bool = False
@@ -1082,14 +1072,14 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         code = f"ATTACH '{path}'"
 
         if name is not None:
-            name = sg.to_identifier(name).sql(self.name)
+            name = sg.to_identifier(name).sql(dialect=self.dialect)
             code += f" AS {name}"
 
         if read_only:
             code += " (READ_ONLY)"
 
-        with self.con.cursor() as cur:
-            cur.execute(code).fetchall()
+        with self._safe_raw_sql(code) as cur:
+            cur.fetchall()
 
     def detach(self, name: str) -> None:
         """Detach a database from the current DuckDB session.
@@ -1100,48 +1090,10 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
             The name of the database to detach.
 
         """
-        name = sg.to_identifier(name).sql(self.name)
-        with self.con.cursor() as cur:
-            cur.execute(f"DETACH {name}").fetchall()
+        name = sg.to_identifier(name).sql(dialect=self.dialect)
 
-    def attach_sqlite(
-        self, path: str | Path, overwrite: bool = False, all_varchar: bool = False
-    ) -> None:
-        """Attach a SQLite database to the current DuckDB session.
-
-        Parameters
-        ----------
-        path
-            The path to the SQLite database.
-        overwrite
-            Allow overwriting any tables or views that already exist in your current
-            session with the contents of the SQLite database.
-        all_varchar
-            Set all SQLite columns to type `VARCHAR` to avoid type errors on ingestion.
-
-        Examples
-        --------
-        >>> import ibis
-        >>> import sqlite3
-        >>> with sqlite3.connect("/tmp/attach_sqlite.db") as con:
-        ...     con.execute("DROP TABLE IF EXISTS t")  # doctest: +ELLIPSIS
-        ...     con.execute("CREATE TABLE t (a INT, b TEXT)")  # doctest: +ELLIPSIS
-        ...     con.execute(
-        ...         "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')"
-        ...     )  # doctest: +ELLIPSIS
-        <...>
-        >>> con = ibis.connect("duckdb://")
-        >>> con.list_tables()
-        []
-        >>> con.attach_sqlite("/tmp/attach_sqlite.db")
-        >>> con.list_tables()
-        ['t']
-
-        """
-        with self._safe_raw_sql(f"SET GLOBAL sqlite_all_varchar={all_varchar}") as cur:
-            cur.execute(
-                f"CALL sqlite_attach('{path}', overwrite={overwrite})"
-            ).fetchall()
+        with self._safe_raw_sql(f"DETACH {name}") as cur:
+            cur.fetchall()
 
     def register_filesystem(self, filesystem: AbstractFileSystem):
         """Register an `fsspec` filesystem object with DuckDB.
@@ -1200,26 +1152,20 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
 
         super()._run_pre_execute_hooks(expr)
 
-    def _to_duckdb_relation(
+    def _to_pyarrow_table(
         self,
         expr: ir.Expr,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
-    ):
-        """Preprocess the expr, and return a ``duckdb.DuckDBPyRelation`` object.
-
-        When retrieving in-memory results, it's faster to use `duckdb_con.sql`
-        than `duckdb_con.execute`, as the query planner can take advantage of
-        knowing the output type. Since the relation objects aren't compatible
-        with the dbapi, we choose to only use them in select internal methods
-        where performance might matter, and use the standard
-        `duckdb_con.execute` everywhere else.
+    ) -> pa.Table:
+        """Preprocess the expr, and return a ``pyarrow.Table`` object.
         """
         self._run_pre_execute_hooks(expr)
         table_expr = expr.as_table()
         sql = self.compile(table_expr, limit=limit, params=params)
-        return self.con.sql(sql)
+        with self._safe_raw_sql(sql) as cur:
+            return cur.fetch_arrow_table()
 
     def to_pyarrow_batches(
         self,
@@ -1271,8 +1217,7 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         limit: int | str | None = None,
         **_: Any,
     ) -> pa.Table:
-        table = self._to_duckdb_relation(expr, params=params, limit=limit).arrow()
-        return expr.__pyarrow_result__(table)
+        return self._to_pyarrow_table(expr, params=params, limit=limit)
 
     def execute(
         self,
@@ -1285,7 +1230,7 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         import pandas as pd
         import pyarrow.types as pat
 
-        table = self._to_duckdb_relation(expr, params=params, limit=limit).arrow()
+        table = self._to_pyarrow_table(expr, params=params, limit=limit)
 
         df = pd.DataFrame(
             {
@@ -1334,7 +1279,7 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
             A dictionary of torch tensors, keyed by column name.
 
         """
-        return self._to_duckdb_relation(expr, params=params, limit=limit).torch()
+        return self._to_pyarrow_table(expr, params=params, limit=limit).torch()
 
     @util.experimental
     def to_parquet(
@@ -1391,8 +1336,8 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         query = self.compile(expr, params=params)
         args = ["FORMAT 'parquet'", *(f"{k.upper()} {v!r}" for k, v in kwargs.items())]
         copy_cmd = f"COPY ({query}) TO {str(path)!r} ({', '.join(args)})"
-        with self._safe_raw_sql(copy_cmd):
-            pass
+        with self._safe_raw_sql(copy_cmd) as cur:
+            cur.fetchall()
 
     @util.experimental
     def to_csv(
@@ -1431,8 +1376,8 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
             *(f"{k.upper()} {v!r}" for k, v in kwargs.items()),
         ]
         copy_cmd = f"COPY ({query}) TO {str(path)!r} ({', '.join(args)})"
-        with self._safe_raw_sql(copy_cmd):
-            pass
+        with self._safe_raw_sql(copy_cmd) as cur:
+            cur.fetchall()
 
     def _get_schema_using_query(self, query: str) -> sch.Schema:
         with self._safe_raw_sql(f"DESCRIBE {query}") as cur:
@@ -1450,53 +1395,6 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
             }
         )
 
-    def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
-        name = op.name
-        try:
-            # this handles tables _and_ views
-            self.con.table(name)
-        except (duckdb.CatalogException, duckdb.InvalidInputException):
-            # only register if we haven't already done so
-            self.con.register(name, op.data.to_pyarrow(op.schema))
-
-    def _register_udfs(self, expr: ir.Expr) -> None:
-        con = self.con
-
-        for udf_node in expr.op().find(ops.ScalarUDF):
-            compile_func = getattr(
-                self, f"_compile_{udf_node.__input_type__.name.lower()}_udf"
-            )
-            with contextlib.suppress(duckdb.InvalidInputException):
-                con.remove_function(udf_node.__class__.__name__)
-
-            registration_func = compile_func(udf_node)
-            if registration_func is not None:
-                registration_func(con)
-
-    def _compile_udf(self, udf_node: ops.ScalarUDF):
-        func = udf_node.__func__
-        name = type(udf_node).__name__
-        type_mapper = self.compiler.type_mapper
-        input_types = [
-            type_mapper.to_string(param.annotation.pattern.dtype)
-            for param in udf_node.__signature__.parameters.values()
-        ]
-        output_type = type_mapper.to_string(udf_node.dtype)
-
-        def register_udf(con):
-            return con.create_function(
-                name,
-                func,
-                input_types,
-                output_type,
-                type=_UDF_INPUT_TYPE_MAPPING[udf_node.__input_type__],
-            )
-
-        return register_udf
-
-    _compile_python_udf = _compile_udf
-    _compile_pyarrow_udf = _compile_udf
-
     def _get_temp_view_definition(self, name: str, definition: str) -> str:
         return sge.Create(
             this=sg.to_identifier(name, quoted=self.compiler.quoted),
@@ -1507,8 +1405,8 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         )
 
     def _create_temp_view(self, table_name, source):
-        with self._safe_raw_sql(self._get_temp_view_definition(table_name, source)):
-            pass
+        with self._safe_raw_sql(self._get_temp_view_definition(table_name, source)) as cur:
+            cur.fetchall()
 
 
 @lazy_singledispatch
@@ -1517,20 +1415,3 @@ def _read_in_memory(source: Any, table_name: str, _conn: Backend, **kwargs: Any)
         f"The `{_conn.name}` backend currently does not support "
         f"reading data of {type(source)!r}"
     )
-
-
-@_read_in_memory.register("polars.DataFrame")
-@_read_in_memory.register("polars.LazyFrame")
-@_read_in_memory.register("pyarrow.Table")
-@_read_in_memory.register("pandas.DataFrame")
-@_read_in_memory.register("pyarrow.dataset.Dataset")
-def _default(source, table_name, _conn, **kwargs: Any):
-    _conn.con.register(table_name, source)
-
-
-@_read_in_memory.register("pyarrow.RecordBatchReader")
-def _pyarrow_rbr(source, table_name, _conn, **kwargs: Any):
-    _conn.con.register(table_name, source)
-    # Ensure the reader isn't marked as started, in case the name is
-    # being overwritten.
-    _conn._record_batch_readers_consumed[table_name] = False
