@@ -133,7 +133,6 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
 
         return self.connect(**kwargs)
 
-
     @property
     def settings(self) -> _Settings:
         return _Settings(self.con)

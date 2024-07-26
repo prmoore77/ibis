@@ -169,7 +169,7 @@ snowflake = ["snowflake-connector-python", "pyarrow", "pyarrow-hotfix"]
 sqlite = ["regex", "pyarrow", "pyarrow-hotfix"]
 risingwave = ["psycopg2", "pyarrow", "pyarrow-hotfix"]
 trino = ["trino", "pyarrow", "pyarrow-hotfix"]
-sqlflite = ["adbc-driver-flightsql", "adbc-driver-manager", "pyarrow", "pyarrow-hotfix"]
+sqlflite = ["adbc-driver-flightsql", "pyarrow", "pyarrow-hotfix"]
 # non-backend extras
 visualization = ["graphviz"]
 decompiler = ["black"]
