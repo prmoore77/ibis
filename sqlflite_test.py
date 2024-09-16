@@ -2,20 +2,17 @@ import os
 import ibis
 from ibis import _
 
+# Kwarg connection example
+con = ibis.sqlflite.connect(host="localhost",
+                            user=os.getenv("SQLFLITE_USERNAME", "sqlflite_username"),
+                            password=os.getenv("SQLFLITE_PASSWORD", "sqlflite_password"),
+                            port=31337,
+                            use_encryption=True,
+                            disable_certificate_verification=True
+                            )
 
-# con = ibis.sqlflite.connect(host="localhost",
-#                             user=os.getenv("SQLFLITE_USERNAME", "sqlflite_username"),
-#                             password=os.getenv("SQLFLITE_PASSWORD", "sqlflite_password"),
-#                             port=31337,
-#                             use_encryption=True,
-#                             disable_certificate_verification=True
-#                             )
-
-# DuckDB
-con = ibis.connect("sqlflite://sqlflite_username:sqlflite_password@localhost:31337?disableCertificateVerification=True&useEncryption=True")
-
-# SQLite
-# con = ibis.connect("sqlflite://sqlflite_username:joe@localhost:31338?useEncryption=False")
+# URL connection example
+# con = ibis.connect("sqlflite://sqlflite_username:sqlflite_password@localhost:31337?disableCertificateVerification=True&useEncryption=True")
 
 print(con.tables)
 

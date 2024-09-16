@@ -84,6 +84,7 @@ shapely = { version = ">=2,<3", optional = true }
 # issues with versions <3.0.2
 snowflake-connector-python = { version = ">=3.0.2,<4,!=3.3.0b1", optional = true }
 trino = { version = ">=0.321,<1", optional = true }
+adbc-driver-flightsql = { version = ">=1.2.0,<2", optional = true }
 
 [tool.poetry.group.dev.dependencies]
 codespell = { version = ">=2.2.6,<3", extras = [
@@ -179,6 +180,16 @@ duckdb = [
   "pandas",
   "rich",
   "packaging",
+]
+sqlflite = [
+  "duckdb",
+  "pyarrow",
+  "pyarrow-hotfix",
+  "numpy",
+  "pandas",
+  "rich",
+  "packaging",
+  "adbc-driver-flightsql",
 ]
 exasol = ["pyexasol", "pyarrow", "pyarrow-hotfix", "numpy", "pandas", "rich"]
 flink = ["pyarrow", "pyarrow-hotfix", "numpy", "pandas", "rich"]
